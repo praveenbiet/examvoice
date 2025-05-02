@@ -1,0 +1,31 @@
+// Auth Types
+export const REGISTER_SUCCESS = 'REGISTER_SUCCESS';
+export const REGISTER_FAIL = 'REGISTER_FAIL';
+export const LOGIN_SUCCESS = 'LOGIN_SUCCESS';
+export const LOGIN_FAIL = 'LOGIN_FAIL';
+export const LOGOUT = 'LOGOUT';
+export const USER_LOADED = 'USER_LOADED';
+export const AUTH_ERROR = 'AUTH_ERROR';
+export const CLEAR_ERRORS = 'CLEAR_ERRORS';
+
+// Exam Types
+export const GET_EXAMS = 'GET_EXAMS';
+export const GET_EXAM = 'GET_EXAM';
+export const GET_SCHEDULED_EXAMS = 'GET_SCHEDULED_EXAMS';
+export const CREATE_EXAM = 'CREATE_EXAM';
+export const UPDATE_EXAM = 'UPDATE_EXAM';
+export const DELETE_EXAM = 'DELETE_EXAM';
+export const TOGGLE_EXAM_STATUS = 'TOGGLE_EXAM_STATUS';
+export const SET_CURRENT_EXAM = 'SET_CURRENT_EXAM';
+export const EXAM_ERROR = 'EXAM_ERROR';
+export const CLEAR_EXAM_ERRORS = 'CLEAR_EXAM_ERRORS';
+
+// Session Types
+export const START_SESSION = 'START_SESSION';
+export const SUBMIT_ANSWER = 'SUBMIT_ANSWER';
+export const GET_SESSION_RESULTS = 'GET_SESSION_RESULTS';
+export const EXTEND_SESSION_TIME = 'EXTEND_SESSION_TIME';
+export const UPDATE_TIME_REMAINING = 'UPDATE_TIME_REMAINING';
+export const SET_CURRENT_SESSION = 'SET_CURRENT_SESSION';
+export const SESSION_ERROR = 'SESSION_ERROR';
+export const CLEAR_SESSION_ERRORS = 'CLEAR_SESSION_ERRORS'; 
