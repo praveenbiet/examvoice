@@ -1,7 +1,8 @@
 from flask import Flask, request, jsonify, send_from_directory, send_file
 from flask_sqlalchemy import SQLAlchemy
 from flask_cors import CORS
-from models import SpeechRecognition, TextToSpeech, AnswerEvaluator, VoiceRecognition, User, Exam, Question, ExamSession, ExamResponse, VoiceProfile
+from flask_socketio import SocketIO, emit
+from models import SpeechRecognition, TextToSpeech, AnswerEvaluator, VoiceRecognition, User, Exam, Question, ExamSession, ExamResponse, VoiceProfile, ExamProgress
 from werkzeug.security import generate_password_hash, check_password_hash
 import os
 from datetime import datetime, timedelta
@@ -13,9 +14,33 @@ import json
 import jwt
 from functools import wraps
 from apscheduler.schedulers.background import BackgroundScheduler
+from flask_limiter import Limiter
+from flask_limiter.util import get_remote_address
+import logging
+from logging.handlers import RotatingFileHandler
+import traceback
+from TTS.api import TTS
+import librosa
+import sounddevice as sd
+import numpy as np
+import noisereduce as nr
+from pydub import AudioSegment
+import matplotlib.pyplot as plt
+import seaborn as sns
+import base64
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+handler = RotatingFileHandler('app.log', maxBytes=10000, backupCount=3)
+handler.setFormatter(logging.Formatter(
+    '%(asctime)s %(levelname)s: %(message)s [in %(pathname)s:%(lineno)d]'
+))
+logger.addHandler(handler)
 
 app = Flask(__name__, static_folder='../frontend/build', static_url_path='')
 CORS(app)
+socketio = SocketIO(app, cors_allowed_origins="*")
 app.config['SECRET_KEY'] = os.urandom(24)
 app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///exam.db'
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
@@ -34,6 +59,28 @@ active_sessions = {}
 
 # Ensure audio_responses directory exists
 os.makedirs('audio_responses', exist_ok=True)
+
+# Initialize rate limiter
+limiter = Limiter(
+    app=app,
+    key_func=get_remote_address,
+    default_limits=["200 per day", "50 per hour"]
+)
+
+# Custom error classes
+class ValidationError(Exception):
+    def __init__(self, message, errors=None):
+        super().__init__(message)
+        self.errors = errors or {}
+
+class AuthenticationError(Exception):
+    pass
+
+class ResourceNotFoundError(Exception):
+    pass
+
+class RateLimitError(Exception):
+    pass
 
 # JWT Authentication decorator
 def token_required(f):
@@ -77,6 +124,75 @@ class ExamSession:
         self.voice_profile_path = voice_profile_path
         self.is_completed = False
         self.last_activity = datetime.now()
+
+# Initialize TTS model for voice cloning
+tts = TTS(model_name="tts_models/multilingual/multi-dataset/your_tts", progress_bar=False)
+
+# Initialize voice quality check components
+recognizer = sr.Recognizer()
+
+def validate_voice_sample(audio_path):
+    """Validate voice sample quality and characteristics"""
+    try:
+        # Load audio file
+        audio, sr = librosa.load(audio_path, sr=16000)
+        
+        # Check duration
+        duration = librosa.get_duration(y=audio, sr=sr)
+        if duration < 5:
+            raise ValidationError("Voice sample too short. Please provide at least 5 seconds of speech.")
+        if duration > 60:
+            raise ValidationError("Voice sample too long. Please provide no more than 60 seconds of speech.")
+        
+        # Check audio quality
+        rms = librosa.feature.rms(y=audio)[0]
+        if np.mean(rms) < 0.01:
+            raise ValidationError("Audio too quiet. Please speak louder.")
+        
+        # Check for background noise
+        noise_reduced = nr.reduce_noise(y=audio, sr=sr)
+        noise_level = np.mean(np.abs(audio - noise_reduced))
+        if noise_level > 0.1:
+            raise ValidationError("Too much background noise. Please record in a quiet environment.")
+        
+        # Check for speech content
+        with sr.AudioFile(audio_path) as source:
+            audio_data = recognizer.record(source)
+            try:
+                text = recognizer.recognize_google(audio_data)
+                if len(text.split()) < 10:
+                    raise ValidationError("Not enough speech content. Please speak more words.")
+            except sr.UnknownValueError:
+                raise ValidationError("Could not detect speech. Please ensure you are speaking clearly.")
+        
+        return {
+            'duration': duration,
+            'noise_level': noise_level,
+            'rms_level': np.mean(rms),
+            'is_valid': True
+        }
+    except Exception as e:
+        raise ValidationError(f"Voice sample validation failed: {str(e)}")
+
+def process_voice_sample(audio_path):
+    """Process and enhance voice sample"""
+    try:
+        # Load audio
+        audio, sr = librosa.load(audio_path, sr=16000)
+        
+        # Remove background noise
+        audio_clean = nr.reduce_noise(y=audio, sr=sr)
+        
+        # Normalize volume
+        audio_norm = librosa.util.normalize(audio_clean)
+        
+        # Save processed audio
+        processed_path = audio_path.replace('.wav', '_processed.wav')
+        librosa.output.write_wav(processed_path, audio_norm, sr)
+        
+        return processed_path
+    except Exception as e:
+        raise ValidationError(f"Voice sample processing failed: {str(e)}")
 
 @app.route('/')
 def serve():
@@ -884,22 +1000,14 @@ def extend_exam_time(current_user, session_id):
 @app.route('/api/sessions/<int:session_id>/time', methods=['GET'])
 @token_required
 def get_time_remaining(current_user, session_id):
-    session = ExamSession.query.get_or_404(session_id)
-    if current_user.role not in ['admin', 'examiner'] and session.candidate_id != current_user.id:
-        return jsonify({'message': 'Unauthorized'}), 403
+    session = ExamSession.query.get(session_id)
+    if not session:
+        return jsonify({'message': 'Session not found'}), 404
     
-    exam = Exam.query.get(session.exam_id)
-    total_allowed_time = exam.duration_minutes + (session.extended_minutes or 0)
-    time_elapsed = (datetime.utcnow() - session.start_time).total_seconds() / 60
-    time_remaining = total_allowed_time - time_elapsed
+    time_remaining = session.get_time_remaining()
+    socketio.emit('time_update', {'session_id': session_id, 'time_remaining': time_remaining}, room=str(session_id))
     
-    return jsonify({
-        'time_elapsed': time_elapsed,
-        'time_remaining': max(0, time_remaining),
-        'total_allowed_time': total_allowed_time,
-        'extended_minutes': session.extended_minutes or 0,
-        'warning_threshold': 5  # minutes before warning
-    })
+    return jsonify({'time_remaining': time_remaining})
 
 # Auto-submit Incomplete Sessions
 def auto_submit_incomplete_sessions():
@@ -924,7 +1032,768 @@ scheduler = BackgroundScheduler()
 scheduler.add_job(auto_submit_incomplete_sessions, 'interval', minutes=1)
 scheduler.start()
 
+@socketio.on('connect')
+def handle_connect():
+    print('Client connected')
+
+@socketio.on('disconnect')
+def handle_disconnect():
+    print('Client disconnected')
+
+@socketio.on('join_session')
+def handle_join_session(data):
+    session_id = data.get('session_id')
+    if session_id:
+        join_room(str(session_id))
+        emit('session_joined', {'session_id': session_id}, room=str(session_id))
+
+@socketio.on('leave_session')
+def handle_leave_session(data):
+    session_id = data.get('session_id')
+    if session_id:
+        leave_room(str(session_id))
+        emit('session_left', {'session_id': session_id}, room=str(session_id))
+
+@socketio.on('question_answered')
+def handle_question_answered(data):
+    session_id = data.get('session_id')
+    question_id = data.get('question_id')
+    if session_id and question_id:
+        emit('answer_submitted', {
+            'session_id': session_id,
+            'question_id': question_id,
+            'timestamp': datetime.utcnow().isoformat()
+        }, room=str(session_id))
+
+@socketio.on('session_status')
+def handle_session_status(data):
+    session_id = data.get('session_id')
+    if session_id:
+        session = ExamSession.query.get(session_id)
+        if session:
+            emit('status_update', {
+                'session_id': session_id,
+                'status': session.status,
+                'progress': len(session.responses),
+                'total_questions': len(session.exam.questions)
+            }, room=str(session_id))
+
+@socketio.on('exam_completed')
+def handle_exam_completed(data):
+    session_id = data.get('session_id')
+    if session_id:
+        session = ExamSession.query.get(session_id)
+        if session:
+            emit('results_ready', {
+                'session_id': session_id,
+                'score': session.total_score,
+                'passing_score': session.exam.passing_score,
+                'passed': session.total_score >= session.exam.passing_score
+            }, room=str(session_id))
+
+# Session state synchronization
+@app.route('/api/sessions/<int:session_id>/sync', methods=['POST'])
+@token_required
+def sync_session_state(current_user, session_id):
+    try:
+        session = ExamSession.query.get_or_404(session_id)
+        if session.candidate_id != current_user.id and current_user.role not in ['admin', 'examiner']:
+            return jsonify({'message': 'Unauthorized'}), 403
+
+        data = request.json
+        if not data:
+            return jsonify({'message': 'No data provided'}), 400
+
+        # Update session state
+        if 'status' in data:
+            session.status = data['status']
+        if 'current_question' in data:
+            session.current_question_id = data['current_question']
+        if 'time_remaining' in data:
+            session.time_remaining = data['time_remaining']
+
+        db.session.commit()
+
+        # Broadcast state update
+        socketio.emit('session_state_update', {
+            'session_id': session_id,
+            'status': session.status,
+            'current_question': session.current_question_id,
+            'time_remaining': session.time_remaining
+        }, room=str(session_id))
+
+        return jsonify({'message': 'Session state synchronized'})
+    except Exception as e:
+        return handle_db_error(e)
+
+# Batch synchronization for multiple sessions
+@app.route('/api/sessions/sync', methods=['POST'])
+@token_required
+def sync_multiple_sessions(current_user):
+    try:
+        data = request.json
+        if not data or not isinstance(data, list):
+            return jsonify({'message': 'Invalid data format'}), 400
+
+        results = []
+        for session_data in data:
+            session_id = session_data.get('session_id')
+            if not session_id:
+                continue
+
+            session = ExamSession.query.get(session_id)
+            if not session:
+                continue
+
+            if session.candidate_id != current_user.id and current_user.role not in ['admin', 'examiner']:
+                continue
+
+            # Update session state
+            if 'status' in session_data:
+                session.status = session_data['status']
+            if 'current_question' in session_data:
+                session.current_question_id = session_data['current_question']
+            if 'time_remaining' in session_data:
+                session.time_remaining = session_data['time_remaining']
+
+            results.append({
+                'session_id': session_id,
+                'status': session.status,
+                'current_question': session.current_question_id,
+                'time_remaining': session.time_remaining
+            })
+
+        db.session.commit()
+
+        # Broadcast updates for each session
+        for result in results:
+            socketio.emit('session_state_update', result, room=str(result['session_id']))
+
+        return jsonify({'message': 'Sessions synchronized', 'results': results})
+    except Exception as e:
+        return handle_db_error(e)
+
+# Progress tracking endpoints
+@app.route('/api/sessions/<int:session_id>/progress', methods=['GET'])
+@token_required
+def get_session_progress(current_user, session_id):
+    try:
+        session = ExamSession.query.get_or_404(session_id)
+        if session.candidate_id != current_user.id and current_user.role not in ['admin', 'examiner']:
+            raise AuthenticationError("Unauthorized")
+        
+        # Update progress metrics
+        session.update_progress()
+        
+        # Get detailed progress
+        progress = ExamProgress.query.filter_by(session_id=session_id).all()
+        
+        return jsonify({
+            'session_id': session_id,
+            'total_questions': session.total_questions,
+            'questions_answered': session.questions_answered,
+            'questions_skipped': session.questions_skipped,
+            'progress_percentage': session.progress_percentage,
+            'average_time_per_question': session.average_time_per_question,
+            'time_remaining': session.time_remaining,
+            'difficulty_distribution': session.difficulty_distribution,
+            'last_activity': session.last_activity.isoformat(),
+            'detailed_progress': [{
+                'question_id': p.question_id,
+                'status': p.status,
+                'time_spent': p.time_spent,
+                'attempts': p.attempts,
+                'confidence_score': p.confidence_score,
+                'difficulty_rating': p.difficulty_rating
+            } for p in progress]
+        })
+    except Exception as e:
+        return handle_generic_error(e)
+
+@app.route('/api/sessions/<int:session_id>/progress/update', methods=['POST'])
+@token_required
+def update_question_progress(current_user, session_id):
+    try:
+        session = ExamSession.query.get_or_404(session_id)
+        if session.candidate_id != current_user.id:
+            raise AuthenticationError("Unauthorized")
+        
+        data = request.json
+        if not data or 'question_id' not in data:
+            raise ValidationError("Question ID is required")
+        
+        question_id = data['question_id']
+        progress = ExamProgress.query.filter_by(
+            session_id=session_id,
+            question_id=question_id
+        ).first()
+        
+        if not progress:
+            progress = ExamProgress(
+                session_id=session_id,
+                question_id=question_id
+            )
+            db.session.add(progress)
+        
+        # Update progress
+        if 'status' in data:
+            progress.status = data['status']
+        if 'difficulty_rating' in data:
+            progress.difficulty_rating = data['difficulty_rating']
+        if 'confidence_score' in data:
+            progress.confidence_score = data['confidence_score']
+        
+        # Update time tracking
+        if progress.status == 'completed':
+            progress.end_time = datetime.utcnow()
+            progress.time_spent = (progress.end_time - progress.start_time).total_seconds()
+        
+        progress.attempts += 1
+        db.session.commit()
+        
+        # Update session and question metrics
+        session.update_progress()
+        progress.question.update_metrics()
+        
+        # Emit progress update
+        socketio.emit('progress_update', {
+            'session_id': session_id,
+            'question_id': question_id,
+            'status': progress.status,
+            'progress_percentage': session.progress_percentage
+        }, room=str(session_id))
+        
+        return jsonify({
+            'message': 'Progress updated successfully',
+            'progress': {
+                'question_id': question_id,
+                'status': progress.status,
+                'time_spent': progress.time_spent,
+                'attempts': progress.attempts
+            }
+        })
+    except Exception as e:
+        return handle_generic_error(e)
+
+@app.route('/api/sessions/<int:session_id>/progress/analytics', methods=['GET'])
+@token_required
+def get_progress_analytics(current_user, session_id):
+    try:
+        session = ExamSession.query.get_or_404(session_id)
+        if session.candidate_id != current_user.id and current_user.role not in ['admin', 'examiner']:
+            raise AuthenticationError("Unauthorized")
+        
+        # Calculate analytics
+        progress = ExamProgress.query.filter_by(session_id=session_id).all()
+        
+        # Time analytics
+        time_spent = [p.time_spent for p in progress if p.time_spent]
+        avg_time = sum(time_spent) / len(time_spent) if time_spent else 0
+        
+        # Difficulty analytics
+        difficulties = [p.difficulty_rating for p in progress if p.difficulty_rating]
+        difficulty_avg = sum(difficulties) / len(difficulties) if difficulties else 0
+        
+        # Confidence analytics
+        confidences = [p.confidence_score for p in progress if p.confidence_score]
+        confidence_avg = sum(confidences) / len(confidences) if confidences else 0
+        
+        # Performance metrics
+        completed = len([p for p in progress if p.status == 'completed'])
+        skipped = len([p for p in progress if p.status == 'skipped'])
+        total = len(progress)
+        
+        return jsonify({
+            'session_id': session_id,
+            'time_analytics': {
+                'average_time_per_question': avg_time,
+                'total_time_spent': sum(time_spent),
+                'time_distribution': {
+                    '0-30s': len([t for t in time_spent if t <= 30]),
+                    '30-60s': len([t for t in time_spent if 30 < t <= 60]),
+                    '60-120s': len([t for t in time_spent if 60 < t <= 120]),
+                    '120s+': len([t for t in time_spent if t > 120])
+                }
+            },
+            'difficulty_analytics': {
+                'average_difficulty': difficulty_avg,
+                'distribution': session.difficulty_distribution
+            },
+            'confidence_analytics': {
+                'average_confidence': confidence_avg,
+                'distribution': {
+                    'high': len([c for c in confidences if c >= 0.8]),
+                    'medium': len([c for c in confidences if 0.5 <= c < 0.8]),
+                    'low': len([c for c in confidences if c < 0.5])
+                }
+            },
+            'performance_metrics': {
+                'completed_questions': completed,
+                'skipped_questions': skipped,
+                'total_questions': total,
+                'completion_rate': (completed / total * 100) if total > 0 else 0
+            }
+        })
+    except Exception as e:
+        return handle_generic_error(e)
+
+# Progress visualization endpoints
+@app.route('/api/sessions/<int:session_id>/progress/visualization/time', methods=['GET'])
+@token_required
+def get_time_visualization(current_user, session_id):
+    try:
+        session = ExamSession.query.get_or_404(session_id)
+        if session.candidate_id != current_user.id and current_user.role not in ['admin', 'examiner']:
+            raise AuthenticationError("Unauthorized")
+        
+        progress = ExamProgress.query.filter_by(session_id=session_id).all()
+        time_data = [p.time_spent for p in progress if p.time_spent]
+        question_numbers = [i+1 for i, p in enumerate(progress) if p.time_spent]
+        
+        # Create time distribution plot
+        plt.figure(figsize=(10, 6))
+        sns.barplot(x=question_numbers, y=time_data)
+        plt.title('Time Spent per Question')
+        plt.xlabel('Question Number')
+        plt.ylabel('Time (seconds)')
+        plt.xticks(rotation=45)
+        
+        # Save plot to bytes
+        buf = io.BytesIO()
+        plt.savefig(buf, format='png', bbox_inches='tight')
+        buf.seek(0)
+        plt.close()
+        
+        # Convert to base64
+        image_base64 = base64.b64encode(buf.getvalue()).decode('utf-8')
+        
+        return jsonify({
+            'image': image_base64,
+            'data': {
+                'question_numbers': question_numbers,
+                'time_spent': time_data,
+                'average_time': sum(time_data) / len(time_data) if time_data else 0
+            }
+        })
+    except Exception as e:
+        return handle_generic_error(e)
+
+@app.route('/api/sessions/<int:session_id>/progress/visualization/difficulty', methods=['GET'])
+@token_required
+def get_difficulty_visualization(current_user, session_id):
+    try:
+        session = ExamSession.query.get_or_404(session_id)
+        if session.candidate_id != current_user.id and current_user.role not in ['admin', 'examiner']:
+            raise AuthenticationError("Unauthorized")
+        
+        progress = ExamProgress.query.filter_by(session_id=session_id).all()
+        difficulties = [p.difficulty_rating for p in progress if p.difficulty_rating]
+        question_numbers = [i+1 for i, p in enumerate(progress) if p.difficulty_rating]
+        
+        # Create difficulty distribution plot
+        plt.figure(figsize=(10, 6))
+        sns.barplot(x=question_numbers, y=difficulties)
+        plt.title('Question Difficulty Ratings')
+        plt.xlabel('Question Number')
+        plt.ylabel('Difficulty (1-5)')
+        plt.xticks(rotation=45)
+        plt.ylim(1, 5)
+        
+        # Save plot to bytes
+        buf = io.BytesIO()
+        plt.savefig(buf, format='png', bbox_inches='tight')
+        buf.seek(0)
+        plt.close()
+        
+        # Convert to base64
+        image_base64 = base64.b64encode(buf.getvalue()).decode('utf-8')
+        
+        return jsonify({
+            'image': image_base64,
+            'data': {
+                'question_numbers': question_numbers,
+                'difficulties': difficulties,
+                'average_difficulty': sum(difficulties) / len(difficulties) if difficulties else 0
+            }
+        })
+    except Exception as e:
+        return handle_generic_error(e)
+
+@app.route('/api/sessions/<int:session_id>/progress/visualization/confidence', methods=['GET'])
+@token_required
+def get_confidence_visualization(current_user, session_id):
+    try:
+        session = ExamSession.query.get_or_404(session_id)
+        if session.candidate_id != current_user.id and current_user.role not in ['admin', 'examiner']:
+            raise AuthenticationError("Unauthorized")
+        
+        progress = ExamProgress.query.filter_by(session_id=session_id).all()
+        confidences = [p.confidence_score for p in progress if p.confidence_score]
+        question_numbers = [i+1 for i, p in enumerate(progress) if p.confidence_score]
+        
+        # Create confidence distribution plot
+        plt.figure(figsize=(10, 6))
+        sns.barplot(x=question_numbers, y=confidences)
+        plt.title('Confidence Scores per Question')
+        plt.xlabel('Question Number')
+        plt.ylabel('Confidence Score (0-1)')
+        plt.xticks(rotation=45)
+        plt.ylim(0, 1)
+        
+        # Save plot to bytes
+        buf = io.BytesIO()
+        plt.savefig(buf, format='png', bbox_inches='tight')
+        buf.seek(0)
+        plt.close()
+        
+        # Convert to base64
+        image_base64 = base64.b64encode(buf.getvalue()).decode('utf-8')
+        
+        return jsonify({
+            'image': image_base64,
+            'data': {
+                'question_numbers': question_numbers,
+                'confidences': confidences,
+                'average_confidence': sum(confidences) / len(confidences) if confidences else 0
+            }
+        })
+    except Exception as e:
+        return handle_generic_error(e)
+
+@app.route('/api/sessions/<int:session_id>/progress/visualization/completion', methods=['GET'])
+@token_required
+def get_completion_visualization(current_user, session_id):
+    try:
+        session = ExamSession.query.get_or_404(session_id)
+        if session.candidate_id != current_user.id and current_user.role not in ['admin', 'examiner']:
+            raise AuthenticationError("Unauthorized")
+        
+        progress = ExamProgress.query.filter_by(session_id=session_id).all()
+        completed = len([p for p in progress if p.status == 'completed'])
+        skipped = len([p for p in progress if p.status == 'skipped'])
+        pending = len([p for p in progress if p.status == 'pending'])
+        
+        # Create completion pie chart
+        plt.figure(figsize=(8, 8))
+        labels = ['Completed', 'Skipped', 'Pending']
+        sizes = [completed, skipped, pending]
+        colors = ['#2ecc71', '#e74c3c', '#f1c40f']
+        plt.pie(sizes, labels=labels, colors=colors, autopct='%1.1f%%', startangle=90)
+        plt.title('Question Completion Status')
+        plt.axis('equal')
+        
+        # Save plot to bytes
+        buf = io.BytesIO()
+        plt.savefig(buf, format='png', bbox_inches='tight')
+        buf.seek(0)
+        plt.close()
+        
+        # Convert to base64
+        image_base64 = base64.b64encode(buf.getvalue()).decode('utf-8')
+        
+        return jsonify({
+            'image': image_base64,
+            'data': {
+                'completed': completed,
+                'skipped': skipped,
+                'pending': pending,
+                'total': len(progress)
+            }
+        })
+    except Exception as e:
+        return handle_generic_error(e)
+
+@app.route('/api/sessions/<int:session_id>/progress/visualization/timeline', methods=['GET'])
+@token_required
+def get_timeline_visualization(current_user, session_id):
+    try:
+        session = ExamSession.query.get_or_404(session_id)
+        if session.candidate_id != current_user.id and current_user.role not in ['admin', 'examiner']:
+            raise AuthenticationError("Unauthorized")
+        
+        progress = ExamProgress.query.filter_by(session_id=session_id).order_by(ExamProgress.start_time).all()
+        
+        # Prepare timeline data
+        timeline_data = []
+        cumulative_time = 0
+        for p in progress:
+            if p.time_spent:
+                cumulative_time += p.time_spent
+                timeline_data.append({
+                    'question_id': p.question_id,
+                    'time_spent': p.time_spent,
+                    'cumulative_time': cumulative_time,
+                    'status': p.status,
+                    'difficulty': p.difficulty_rating,
+                    'confidence': p.confidence_score
+                })
+        
+        # Create timeline plot
+        plt.figure(figsize=(12, 6))
+        x = [d['cumulative_time'] for d in timeline_data]
+        y = [d['question_id'] for d in timeline_data]
+        colors = ['#2ecc71' if d['status'] == 'completed' else '#e74c3c' if d['status'] == 'skipped' else '#f1c40f' for d in timeline_data]
+        
+        plt.scatter(x, y, c=colors, s=100)
+        plt.plot(x, y, 'k--', alpha=0.3)
+        plt.title('Exam Progress Timeline')
+        plt.xlabel('Cumulative Time (seconds)')
+        plt.ylabel('Question Number')
+        
+        # Save plot to bytes
+        buf = io.BytesIO()
+        plt.savefig(buf, format='png', bbox_inches='tight')
+        buf.seek(0)
+        plt.close()
+        
+        # Convert to base64
+        image_base64 = base64.b64encode(buf.getvalue()).decode('utf-8')
+        
+        return jsonify({
+            'image': image_base64,
+            'data': timeline_data
+        })
+    except Exception as e:
+        return handle_generic_error(e)
+
+# Error handlers
+@app.errorhandler(ValidationError)
+def handle_validation_error(error):
+    logger.warning(f"Validation error: {str(error)}")
+    return jsonify({
+        'error': 'Validation Error',
+        'message': str(error),
+        'errors': error.errors
+    }), 400
+
+@app.errorhandler(AuthenticationError)
+def handle_auth_error(error):
+    logger.warning(f"Authentication error: {str(error)}")
+    return jsonify({
+        'error': 'Authentication Error',
+        'message': str(error)
+    }), 401
+
+@app.errorhandler(ResourceNotFoundError)
+def handle_not_found_error(error):
+    logger.warning(f"Resource not found: {str(error)}")
+    return jsonify({
+        'error': 'Resource Not Found',
+        'message': str(error)
+    }), 404
+
+@app.errorhandler(RateLimitError)
+def handle_rate_limit_error(error):
+    logger.warning(f"Rate limit exceeded: {str(error)}")
+    return jsonify({
+        'error': 'Rate Limit Exceeded',
+        'message': str(error)
+    }), 429
+
+@app.errorhandler(Exception)
+def handle_generic_error(error):
+    logger.error(f"Unexpected error: {str(error)}\n{traceback.format_exc()}")
+    return jsonify({
+        'error': 'Internal Server Error',
+        'message': 'An unexpected error occurred'
+    }), 500
+
+# WebSocket error handling
+@socketio.on_error()
+def handle_error(e):
+    logger.error(f"WebSocket error: {str(e)}\n{traceback.format_exc()}")
+    emit('error', {
+        'error': 'WebSocket Error',
+        'message': str(e)
+    })
+
+@socketio.on_error_default
+def default_error_handler(e):
+    logger.error(f"Default WebSocket error: {str(e)}\n{traceback.format_exc()}")
+    emit('error', {
+        'error': 'WebSocket Error',
+        'message': str(e)
+    })
+
+# Database error handling
+def handle_db_error(e):
+    logger.error(f"Database error: {str(e)}\n{traceback.format_exc()}")
+    db.session.rollback()
+    return jsonify({
+        'error': 'Database Error',
+        'message': str(e)
+    }), 500
+
+# File upload error handling
+def handle_file_upload_error(e):
+    logger.error(f"File upload error: {str(e)}\n{traceback.format_exc()}")
+    return jsonify({
+        'error': 'File Upload Error',
+        'message': str(e)
+    }), 400
+
+# Network error handling
+def handle_network_error(e):
+    logger.error(f"Network error: {str(e)}\n{traceback.format_exc()}")
+    return jsonify({
+        'error': 'Network Error',
+        'message': str(e)
+    }), 503
+
+# Voice cloning endpoints
+@app.route('/api/voice-clone/upload', methods=['POST'])
+@token_required
+def upload_voice_sample(current_user):
+    try:
+        if 'audio' not in request.files:
+            raise ValidationError("No audio file provided")
+        
+        audio_file = request.files['audio']
+        if not audio_file.filename.endswith(('.wav', '.mp3')):
+            raise ValidationError("Invalid file format. Please upload WAV or MP3")
+        
+        # Create user's voice profile directory if it doesn't exist
+        user_voice_dir = os.path.join('voice_profiles', str(current_user.id))
+        os.makedirs(user_voice_dir, exist_ok=True)
+        
+        # Save the audio file
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        audio_path = os.path.join(user_voice_dir, f"sample_{timestamp}.wav")
+        audio_file.save(audio_path)
+        
+        # Validate voice sample
+        validation_result = validate_voice_sample(audio_path)
+        
+        # Process voice sample
+        processed_path = process_voice_sample(audio_path)
+        
+        # Create voice profile
+        voice_profile = VoiceProfile(
+            user_id=current_user.id,
+            audio_path=processed_path,
+            created_at=datetime.utcnow(),
+            sample_duration=validation_result['duration'],
+            quality_score=validation_result['rms_level'] * (1 - validation_result['noise_level'])
+        )
+        db.session.add(voice_profile)
+        db.session.commit()
+        
+        return jsonify({
+            'message': 'Voice sample uploaded and validated successfully',
+            'voice_profile_id': voice_profile.id,
+            'validation': validation_result
+        })
+    except Exception as e:
+        return handle_file_upload_error(e)
+
+@app.route('/api/voice-clone/generate', methods=['POST'])
+@token_required
+def generate_cloned_voice(current_user):
+    try:
+        data = request.json
+        if not data or 'text' not in data:
+            raise ValidationError("Text is required")
+        
+        # Get user's voice profile
+        voice_profile = VoiceProfile.query.filter_by(user_id=current_user.id).first()
+        if not voice_profile:
+            raise ResourceNotFoundError("No voice profile found. Please upload a voice sample first.")
+        
+        # Generate speech with cloned voice
+        output_path = os.path.join('voice_profiles', str(current_user.id), f"generated_{datetime.now().strftime('%Y%m%d_%H%M%S')}.wav")
+        tts.tts_to_file(
+            text=data['text'],
+            speaker_wav=voice_profile.audio_path,
+            file_path=output_path
+        )
+        
+        return send_file(output_path, mimetype='audio/wav')
+    except Exception as e:
+        return handle_generic_error(e)
+
+@app.route('/api/voice-clone/status', methods=['GET'])
+@token_required
+def get_voice_clone_status(current_user):
+    try:
+        voice_profile = VoiceProfile.query.filter_by(user_id=current_user.id).first()
+        if not voice_profile:
+            return jsonify({'status': 'not_available'})
+        
+        return jsonify({
+            'status': 'available',
+            'created_at': voice_profile.created_at.isoformat(),
+            'sample_duration': voice_profile.sample_duration if hasattr(voice_profile, 'sample_duration') else None
+        })
+    except Exception as e:
+        return handle_generic_error(e)
+
+@app.route('/api/voice-clone/quality', methods=['GET'])
+@token_required
+def get_voice_quality(current_user):
+    try:
+        voice_profile = VoiceProfile.query.filter_by(user_id=current_user.id).first()
+        if not voice_profile:
+            return jsonify({'status': 'not_available'})
+        
+        # Re-validate voice sample
+        validation_result = validate_voice_sample(voice_profile.audio_path)
+        
+        return jsonify({
+            'status': 'available',
+            'quality_score': voice_profile.quality_score,
+            'validation': validation_result,
+            'recommendations': get_quality_recommendations(validation_result)
+        })
+    except Exception as e:
+        return handle_generic_error(e)
+
+def get_quality_recommendations(validation_result):
+    """Generate recommendations based on voice sample quality"""
+    recommendations = []
+    
+    if validation_result['duration'] < 10:
+        recommendations.append("Consider providing a longer voice sample (10-30 seconds) for better quality.")
+    
+    if validation_result['noise_level'] > 0.05:
+        recommendations.append("Try recording in a quieter environment to reduce background noise.")
+    
+    if validation_result['rms_level'] < 0.02:
+        recommendations.append("Speak louder and closer to the microphone for better audio quality.")
+    
+    return recommendations
+
+# Update the exam session to use cloned voice
+@app.route('/api/sessions/<int:session_id>/start', methods=['POST'])
+@token_required
+def start_exam_session(current_user, session_id):
+    try:
+        session = ExamSession.query.get_or_404(session_id)
+        if session.candidate_id != current_user.id:
+            raise AuthenticationError("Unauthorized")
+        
+        # Check if user has voice profile
+        voice_profile = VoiceProfile.query.filter_by(user_id=current_user.id).first()
+        use_cloned_voice = voice_profile is not None
+        
+        session.status = 'in_progress'
+        session.start_time = datetime.utcnow()
+        session.use_cloned_voice = use_cloned_voice
+        db.session.commit()
+        
+        # Emit session started event with voice preference
+        socketio.emit('session_started', {
+            'session_id': session_id,
+            'use_cloned_voice': use_cloned_voice
+        }, room=str(session_id))
+        
+        return jsonify({
+            'message': 'Exam session started',
+            'use_cloned_voice': use_cloned_voice
+        })
+    except Exception as e:
+        return handle_generic_error(e)
+
 if __name__ == '__main__':
     with app.app_context():
         db.create_all()
-    app.run(debug=True) 
+    socketio.run(app, debug=True) 

@@ -1,4 +1,4 @@
-import api, { createAuthenticatedCallWithToken } from '../../utils/api';
+import api, { createAuthenticatedCallWithToken, createPaginatedCall } from '../../utils/api';
 import {
     GET_EXAMS,
     GET_EXAM,
@@ -12,14 +12,16 @@ import {
     SET_CURRENT_EXAM
 } from '../types';
 
-// Get all exams
-export const getExams = () => async (dispatch, getState) => {
-    return createAuthenticatedCallWithToken(
+// Get all exams with pagination
+export const getExams = (page = 1, limit = 10) => async (dispatch, getState) => {
+    return createPaginatedCall(
         dispatch,
         getState,
         GET_EXAMS,
-        () => api.get('/exams'),
-        EXAM_ERROR
+        (page, limit) => api.get(`/exams?page=${page}&limit=${limit}`),
+        EXAM_ERROR,
+        page,
+        limit
     );
 };
 

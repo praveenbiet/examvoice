@@ -63,9 +63,30 @@ class Question(db.Model):
     max_score = db.Column(db.Float, nullable=False)
     order = db.Column(db.Integer, nullable=False)
     
+    # Progress tracking fields
+    average_time_spent = db.Column(db.Float)  # Average time spent by all candidates
+    success_rate = db.Column(db.Float)  # Percentage of correct answers
+    difficulty_level = db.Column(db.Integer)  # 1-5 rating
+    attempts_count = db.Column(db.Integer, default=0)  # Total attempts across all sessions
+    
     # Relationships
     responses = db.relationship('ExamResponse', backref='question', lazy=True)
-    
+    exam = db.relationship('Exam', backref=db.backref('questions', lazy=True))
+
+    def update_metrics(self):
+        """Update question metrics based on all attempts"""
+        responses = self.responses
+        if responses:
+            self.attempts_count = len(responses)
+            self.success_rate = sum(1 for r in responses if r.score >= r.question.max_score * 0.7) / len(responses) * 100
+            
+            # Calculate average time spent
+            progress_entries = ExamProgress.query.filter_by(question_id=self.id).all()
+            if progress_entries:
+                self.average_time_spent = sum(p.time_spent for p in progress_entries if p.time_spent) / len(progress_entries)
+        
+        db.session.commit()
+
     def __repr__(self):
         return f'<Question {self.id}>'
 
@@ -75,14 +96,57 @@ class ExamSession(db.Model):
     id = db.Column(db.Integer, primary_key=True)
     exam_id = db.Column(db.Integer, db.ForeignKey('exams.id'), nullable=False)
     candidate_id = db.Column(db.Integer, db.ForeignKey('users.id'), nullable=False)
-    start_time = db.Column(db.DateTime, default=datetime.utcnow)
+    start_time = db.Column(db.DateTime)
     end_time = db.Column(db.DateTime)
-    status = db.Column(db.String(20), default='in_progress')  # 'in_progress', 'completed', 'abandoned'
-    total_score = db.Column(db.Float, default=0.0)
+    status = db.Column(db.String(20), default='pending')  # pending, in_progress, completed
+    score = db.Column(db.Float)
+    current_question_id = db.Column(db.Integer, db.ForeignKey('questions.id'))
+    time_remaining = db.Column(db.Integer)  # in seconds
+    use_cloned_voice = db.Column(db.Boolean, default=False)
     
-    # Relationships
+    # Progress tracking fields
+    total_questions = db.Column(db.Integer)
+    questions_answered = db.Column(db.Integer, default=0)
+    questions_skipped = db.Column(db.Integer, default=0)
+    average_time_per_question = db.Column(db.Float)
+    last_activity = db.Column(db.DateTime, default=datetime.utcnow)
+    progress_percentage = db.Column(db.Float, default=0.0)
+    difficulty_distribution = db.Column(db.JSON)  # Store difficulty distribution
+    
+    exam = db.relationship('Exam', backref=db.backref('sessions', lazy=True))
+    candidate = db.relationship('User', backref=db.backref('exam_sessions', lazy=True))
+    current_question = db.relationship('Question')
     responses = db.relationship('ExamResponse', backref='session', lazy=True)
-    
+
+    def update_progress(self):
+        """Update session progress metrics"""
+        total = self.total_questions or len(self.exam.questions)
+        answered = len([p for p in self.progress if p.status == 'completed'])
+        skipped = len([p for p in self.progress if p.status == 'skipped'])
+        
+        self.questions_answered = answered
+        self.questions_skipped = skipped
+        self.progress_percentage = ((answered + skipped) / total) * 100 if total > 0 else 0
+        
+        # Calculate average time per question
+        completed_questions = [p for p in self.progress if p.time_spent is not None]
+        if completed_questions:
+            self.average_time_per_question = sum(p.time_spent for p in completed_questions) / len(completed_questions)
+        
+        # Update difficulty distribution
+        difficulties = [p.difficulty_rating for p in self.progress if p.difficulty_rating is not None]
+        if difficulties:
+            self.difficulty_distribution = {
+                '1': difficulties.count(1),
+                '2': difficulties.count(2),
+                '3': difficulties.count(3),
+                '4': difficulties.count(4),
+                '5': difficulties.count(5)
+            }
+        
+        self.last_activity = datetime.utcnow()
+        db.session.commit()
+
     def __repr__(self):
         return f'<ExamSession {self.id}>'
 
@@ -106,12 +170,11 @@ class VoiceProfile(db.Model):
     
     id = db.Column(db.Integer, primary_key=True)
     user_id = db.Column(db.Integer, db.ForeignKey('users.id'), nullable=False)
-    voice_sample_path = db.Column(db.String(500), nullable=False)
+    audio_path = db.Column(db.String(255), nullable=False)
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
-    is_active = db.Column(db.Boolean, default=True)
+    sample_duration = db.Column(db.Float)  # Duration in seconds
     
-    def __repr__(self):
-        return f'<VoiceProfile {self.id}>'
+    user = db.relationship('User', backref=db.backref('voice_profile', uselist=False))
 
 class VoiceRecognition:
     def __init__(self):
@@ -213,4 +276,21 @@ class AnswerEvaluator:
         
         # Calculate cosine similarity
         similarity = 1 - cosine(candidate_embedding, correct_embedding)
-        return float(similarity) 
+        return float(similarity)
+
+class ExamProgress(db.Model):
+    __tablename__ = 'exam_progress'
+    
+    id = db.Column(db.Integer, primary_key=True)
+    session_id = db.Column(db.Integer, db.ForeignKey('exam_sessions.id'), nullable=False)
+    question_id = db.Column(db.Integer, db.ForeignKey('questions.id'), nullable=False)
+    start_time = db.Column(db.DateTime, default=datetime.utcnow)
+    end_time = db.Column(db.DateTime)
+    time_spent = db.Column(db.Integer)  # in seconds
+    attempts = db.Column(db.Integer, default=0)
+    status = db.Column(db.String(20), default='pending')  # pending, in_progress, completed, skipped
+    confidence_score = db.Column(db.Float)  # Confidence in the answer
+    difficulty_rating = db.Column(db.Integer)  # 1-5 rating of question difficulty
+    
+    session = db.relationship('ExamSession', backref=db.backref('progress', lazy=True))
+    question = db.relationship('Question', backref=db.backref('progress', lazy=True)) 

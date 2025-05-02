@@ -1,5 +1,7 @@
 flask==2.3.3
 flask-sqlalchemy==3.1.1
+flask-socketio==5.3.6
+flask-limiter==3.5.0
 transformers==4.34.0
 torch==2.1.0
 speechbrain==0.5.15
@@ -12,4 +14,13 @@ soundfile==0.12.1
 dia @ git+https://github.com/nari-labs/dia.git
 nemo_toolkit['asr'] @ git+https://github.com/NVIDIA/NeMo.git
 pytorch_lightning==2.0.5
-torchaudio==2.1.0 
+torchaudio==2.1.0
+python-json-logger==2.0.7
+TTS @ git+https://github.com/coqui-ai/TTS.git
+librosa==0.10.1
+sounddevice==0.4.6
+noisereduce==2.0.0
+pydub==0.25.1
+SpeechRecognition==3.10.0
+matplotlib==3.7.2
+seaborn==0.12.2 

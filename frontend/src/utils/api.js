@@ -1,4 +1,5 @@
 import axios from 'axios';
+import { io } from 'socket.io-client';
 
 // Create axios instance with base URL
 const api = axios.create({
@@ -7,6 +8,39 @@ const api = axios.create({
         'Content-Type': 'application/json'
     }
 });
+
+// Create socket instance
+const socket = io(process.env.REACT_APP_WS_URL || 'ws://localhost:5000', {
+    autoConnect: false,
+    reconnection: true,
+    reconnectionDelay: 1000,
+    reconnectionDelayMax: 5000,
+    reconnectionAttempts: 5
+});
+
+// Add request interceptor for logging
+api.interceptors.request.use(
+    config => {
+        console.log('Request:', config.method.toUpperCase(), config.url, config.data);
+        return config;
+    },
+    error => {
+        console.error('Request error:', error);
+        return Promise.reject(error);
+    }
+);
+
+// Add response interceptor for logging
+api.interceptors.response.use(
+    response => {
+        console.log('Response:', response.status, response.data);
+        return response;
+    },
+    error => {
+        console.error('Response error:', error.response?.data || error.message);
+        return Promise.reject(error);
+    }
+);
 
 // Add token to requests
 export const setAuthToken = (token) => {
@@ -133,6 +167,97 @@ export const createAuthenticatedCallWithToken = async (dispatch, getState, actio
     const token = getState().auth.token;
     setAuthToken(token);
     return createAuthenticatedCall(dispatch, action, apiCall, errorType);
+};
+
+// Create paginated API call
+export const createPaginatedCall = async (dispatch, getState, action, apiCall, errorType, page = 1, limit = 10) => {
+    return createAuthenticatedCallWithToken(
+        dispatch,
+        getState,
+        action,
+        () => apiCall(page, limit),
+        errorType
+    );
+};
+
+// Handle file upload with progress
+export const uploadFileWithProgress = async (file, endpoint, token, onProgress) => {
+    const formData = new FormData();
+    formData.append('file', file);
+
+    const config = {
+        headers: {
+            'Authorization': `Bearer ${token}`,
+            'Content-Type': 'multipart/form-data'
+        },
+        onUploadProgress: (progressEvent) => {
+            const percentCompleted = Math.round((progressEvent.loaded * 100) / progressEvent.total);
+            onProgress(percentCompleted);
+        }
+    };
+
+    return await api.post(endpoint, formData, config);
+};
+
+// Create batch API call
+export const createBatchCall = async (dispatch, getState, action, apiCalls, errorType) => {
+    const token = getState().auth.token;
+    setAuthToken(token);
+
+    try {
+        const results = await Promise.all(apiCalls.map(call => call()));
+        const combinedData = results.map(res => res.data);
+        
+        dispatch({
+            type: action,
+            payload: combinedData
+        });
+        
+        return combinedData;
+    } catch (err) {
+        const error = handleApiError(err);
+        dispatch({
+            type: errorType,
+            payload: error.message
+        });
+        throw error;
+    }
+};
+
+// Socket event handlers
+export const setupSocket = (onConnect, onDisconnect, onError) => {
+    socket.on('connect', () => {
+        console.log('Connected to WebSocket server');
+        onConnect?.();
+    });
+
+    socket.on('disconnect', () => {
+        console.log('Disconnected from WebSocket server');
+        onDisconnect?.();
+    });
+
+    socket.on('error', (error) => {
+        console.error('WebSocket error:', error);
+        onError?.(error);
+    });
+
+    return socket;
+};
+
+// Join exam session
+export const joinExamSession = (sessionId, onTimeUpdate) => {
+    socket.emit('join_session', { session_id: sessionId });
+    socket.on('time_update', (data) => {
+        if (data.session_id === sessionId) {
+            onTimeUpdate?.(data.time_remaining);
+        }
+    });
+};
+
+// Leave exam session
+export const leaveExamSession = (sessionId) => {
+    socket.emit('leave_session', { session_id: sessionId });
+    socket.off('time_update');
 };
 
 export default api; 
