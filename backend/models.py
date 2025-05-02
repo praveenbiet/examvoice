@@ -8,6 +8,41 @@ import soundfile as sf
 from dia.model import Dia
 import os
 from datetime import datetime
+import torchaudio
+from speechbrain.pretrained import SpeakerRecognition
+
+class VoiceRecognition:
+    def __init__(self):
+        # Initialize speaker recognition model
+        self.speaker_model = SpeakerRecognition.from_hparams(
+            source="speechbrain/spkrec-ecapa-voxceleb",
+            savedir="pretrained_models/spkrec-ecapa-voxceleb"
+        )
+        self.voice_profiles = {}  # Store voice embeddings for each user
+    
+    def extract_voice_features(self, audio_path):
+        # Extract voice features from audio
+        signal, fs = torchaudio.load(audio_path)
+        embeddings = self.speaker_model.encode_batch(signal)
+        return embeddings.squeeze(0)
+    
+    def register_voice(self, user_id, audio_path):
+        # Register a new voice profile
+        embeddings = self.extract_voice_features(audio_path)
+        self.voice_profiles[user_id] = embeddings
+        return True
+    
+    def verify_speaker(self, audio_path, user_id):
+        # Verify if the speaker matches the registered profile
+        if user_id not in self.voice_profiles:
+            return False
+        
+        test_embeddings = self.extract_voice_features(audio_path)
+        similarity = self.speaker_model.similarity(
+            test_embeddings, 
+            self.voice_profiles[user_id]
+        )
+        return similarity > 0.7  # Threshold for verification
 
 class SpeechRecognition:
     def __init__(self):

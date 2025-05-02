@@ -54,6 +54,20 @@
             border-radius: 8px;
             margin-bottom: 1rem;
         }
+        .verification-status {
+            margin: 1rem 0;
+            padding: 0.5rem;
+            border-radius: 4px;
+            display: none;
+        }
+        .verification-success {
+            background-color: #d4edda;
+            color: #155724;
+        }
+        .verification-failure {
+            background-color: #f8d7da;
+            color: #721c24;
+        }
     </style>
 </head>
 <body>
@@ -65,7 +79,21 @@
                 <label for="candidate-id" class="form-label">Enter your Candidate ID:</label>
                 <input type="text" class="form-control" id="candidate-id" required>
             </div>
+            <div class="mb-3">
+                <label class="form-label">Record your voice for verification:</label>
+                <button class="btn btn-primary" onclick="startVoiceRegistration()">Start Recording</button>
+                <button class="btn btn-danger" onclick="stopVoiceRegistration()" disabled>Stop Recording</button>
+                <span class="recording-indicator">Recording...</span>
+            </div>
             <button class="btn btn-primary" onclick="startExam()">Start Exam</button>
+        </div>
+
+        <div id="verification-section" style="display: none;">
+            <h3>Voice Verification</h3>
+            <p>Please speak to verify your identity:</p>
+            <button class="btn btn-primary" onclick="startVerification()">Start Verification</button>
+            <button class="btn btn-danger" onclick="stopVerification()" disabled>Stop Verification</button>
+            <div id="verification-status" class="verification-status"></div>
         </div>
 
         <div id="exam-section" style="display: none;">
@@ -112,31 +140,129 @@
         let analyser;
         let canvasContext;
         let animationFrame;
+        let candidateId = null;
+        let examSession = null;
+
+        async function startVoiceRegistration() {
+            try {
+                const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+                mediaRecorder = new MediaRecorder(stream);
+                audioChunks = [];
+
+                mediaRecorder.ondataavailable = (event) => {
+                    audioChunks.push(event.data);
+                };
+
+                mediaRecorder.onstop = async () => {
+                    const audioBlob = new Blob(audioChunks, { type: 'audio/wav' });
+                    // The audio blob will be sent with the start exam request
+                };
+
+                mediaRecorder.start();
+                document.querySelector('.recording-indicator').style.display = 'inline';
+                document.querySelector('button[onclick="startVoiceRegistration()"]').disabled = true;
+                document.querySelector('button[onclick="stopVoiceRegistration()"]').disabled = false;
+            } catch (err) {
+                console.error('Error accessing microphone:', err);
+                alert('Error accessing microphone. Please ensure you have granted microphone permissions.');
+            }
+        }
+
+        function stopVoiceRegistration() {
+            mediaRecorder.stop();
+            document.querySelector('.recording-indicator').style.display = 'none';
+            document.querySelector('button[onclick="startVoiceRegistration()"]').disabled = false;
+            document.querySelector('button[onclick="stopVoiceRegistration()"]').disabled = true;
+        }
 
         async function startExam() {
-            const candidateId = document.getElementById('candidate-id').value;
+            candidateId = document.getElementById('candidate-id').value;
             if (!candidateId) {
                 alert('Please enter your Candidate ID');
                 return;
             }
 
+            const formData = new FormData();
+            formData.append('candidate_id', candidateId);
+            formData.append('voice_sample', new Blob(audioChunks, { type: 'audio/wav' }));
+
             const response = await fetch('/start_exam', {
                 method: 'POST',
-                headers: {
-                    'Content-Type': 'application/x-www-form-urlencoded',
-                },
-                body: `candidate_id=${candidateId}`
+                body: formData
             });
 
             if (response.ok) {
+                const data = await response.json();
+                examSession = data;
                 document.getElementById('login-section').style.display = 'none';
-                document.getElementById('exam-section').style.display = 'block';
-                getNextQuestion();
+                document.getElementById('verification-section').style.display = 'block';
+            } else {
+                alert('Error starting exam. Please try again.');
+            }
+        }
+
+        async function startVerification() {
+            try {
+                const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+                mediaRecorder = new MediaRecorder(stream);
+                audioChunks = [];
+
+                mediaRecorder.ondataavailable = (event) => {
+                    audioChunks.push(event.data);
+                };
+
+                mediaRecorder.onstop = async () => {
+                    const audioBlob = new Blob(audioChunks, { type: 'audio/wav' });
+                    await verifyIdentity(audioBlob);
+                };
+
+                mediaRecorder.start();
+                document.querySelector('button[onclick="startVerification()"]').disabled = true;
+                document.querySelector('button[onclick="stopVerification()"]').disabled = false;
+            } catch (err) {
+                console.error('Error accessing microphone:', err);
+                alert('Error accessing microphone. Please ensure you have granted microphone permissions.');
+            }
+        }
+
+        function stopVerification() {
+            mediaRecorder.stop();
+            document.querySelector('button[onclick="startVerification()"]').disabled = false;
+            document.querySelector('button[onclick="stopVerification()"]').disabled = true;
+        }
+
+        async function verifyIdentity(audioBlob) {
+            const formData = new FormData();
+            formData.append('candidate_id', candidateId);
+            formData.append('voice_sample', audioBlob);
+
+            const response = await fetch('/verify_identity', {
+                method: 'POST',
+                body: formData
+            });
+
+            const data = await response.json();
+            const statusDiv = document.getElementById('verification-status');
+            
+            if (response.ok) {
+                statusDiv.className = 'verification-status verification-success';
+                statusDiv.textContent = 'Identity verified successfully!';
+                statusDiv.style.display = 'block';
+                
+                setTimeout(() => {
+                    document.getElementById('verification-section').style.display = 'none';
+                    document.getElementById('exam-section').style.display = 'block';
+                    getNextQuestion();
+                }, 2000);
+            } else {
+                statusDiv.className = 'verification-status verification-failure';
+                statusDiv.textContent = 'Verification failed. Please try again.';
+                statusDiv.style.display = 'block';
             }
         }
 
         async function getNextQuestion() {
-            const response = await fetch('/get_question');
+            const response = await fetch(`/get_question?candidate_id=${candidateId}`);
             const data = await response.json();
             document.getElementById('question-text').textContent = data.question_text;
             currentQuestionId = data.question_id;
@@ -242,6 +368,7 @@
                 const formData = new FormData();
                 formData.append('audio', audioBlob);
                 formData.append('question_id', currentQuestionId);
+                formData.append('candidate_id', candidateId);
 
                 const response = await fetch('/process_answer', {
                     method: 'POST',
@@ -256,7 +383,13 @@
                 document.getElementById('feedback-section').style.display = 'block';
                 document.getElementById('feedback-text').textContent = result.feedback;
                 document.getElementById('similarity-score').textContent = `Similarity Score: ${(result.similarity_score * 100).toFixed(2)}%`;
-                document.getElementById('next-btn').style.display = 'block';
+                
+                if (!result.is_completed) {
+                    document.getElementById('next-btn').style.display = 'block';
+                } else {
+                    document.getElementById('next-btn').style.display = 'none';
+                    alert('Exam completed! Thank you for participating.');
+                }
             } catch (error) {
                 console.error('Error submitting answer:', error);
                 alert('There was an error processing your answer. Please try again.');
