@@ -1,4 +1,4 @@
-import axios from 'axios';
+import api, { createAuthenticatedCallWithToken } from '../../utils/api';
 import {
     START_SESSION,
     SUBMIT_ANSWER,
@@ -12,126 +12,54 @@ import {
 
 // Start exam session
 export const startSession = (examId) => async (dispatch, getState) => {
-    try {
-        const token = getState().auth.token;
-        const config = {
-            headers: {
-                'Authorization': `Bearer ${token}`
-            }
-        };
-
-        const res = await axios.post(`/api/exams/${examId}/start`, {}, config);
-        dispatch({
-            type: START_SESSION,
-            payload: res.data
-        });
-    } catch (err) {
-        dispatch({
-            type: SESSION_ERROR,
-            payload: err.response?.data?.message || 'Error starting session'
-        });
-    }
+    return createAuthenticatedCallWithToken(
+        dispatch,
+        getState,
+        START_SESSION,
+        () => api.post(`/exams/${examId}/start`, {}),
+        SESSION_ERROR
+    );
 };
 
 // Submit answer
-export const submitAnswer = (sessionId, questionId, audioFile) => async (dispatch, getState) => {
-    try {
-        const token = getState().auth.token;
-        const formData = new FormData();
-        formData.append('audio', audioFile);
-        formData.append('question_id', questionId);
-
-        const config = {
-            headers: {
-                'Authorization': `Bearer ${token}`,
-                'Content-Type': 'multipart/form-data'
-            }
-        };
-
-        const res = await axios.post(`/api/sessions/${sessionId}/answers`, formData, config);
-        dispatch({
-            type: SUBMIT_ANSWER,
-            payload: res.data
-        });
-    } catch (err) {
-        dispatch({
-            type: SESSION_ERROR,
-            payload: err.response?.data?.message || 'Error submitting answer'
-        });
-    }
+export const submitAnswer = (sessionId, answerData) => async (dispatch, getState) => {
+    return createAuthenticatedCallWithToken(
+        dispatch,
+        getState,
+        SUBMIT_ANSWER,
+        () => api.post(`/sessions/${sessionId}/answer`, answerData),
+        SESSION_ERROR
+    );
 };
 
 // Get session results
 export const getSessionResults = (sessionId) => async (dispatch, getState) => {
-    try {
-        const token = getState().auth.token;
-        const config = {
-            headers: {
-                'Authorization': `Bearer ${token}`
-            }
-        };
-
-        const res = await axios.get(`/api/sessions/${sessionId}/results`, config);
-        dispatch({
-            type: GET_SESSION_RESULTS,
-            payload: res.data
-        });
-    } catch (err) {
-        dispatch({
-            type: SESSION_ERROR,
-            payload: err.response?.data?.message || 'Error fetching results'
-        });
-    }
+    return createAuthenticatedCallWithToken(
+        dispatch,
+        getState,
+        GET_SESSION_RESULTS,
+        () => api.get(`/sessions/${sessionId}/results`),
+        SESSION_ERROR
+    );
 };
 
 // Extend session time
-export const extendSessionTime = (sessionId, additionalMinutes) => async (dispatch, getState) => {
-    try {
-        const token = getState().auth.token;
-        const config = {
-            headers: {
-                'Authorization': `Bearer ${token}`
-            }
-        };
-
-        const res = await axios.post(
-            `/api/sessions/${sessionId}/extend`,
-            { additional_minutes: additionalMinutes },
-            config
-        );
-        dispatch({
-            type: EXTEND_SESSION_TIME,
-            payload: res.data.total_extension
-        });
-    } catch (err) {
-        dispatch({
-            type: SESSION_ERROR,
-            payload: err.response?.data?.message || 'Error extending session time'
-        });
-    }
+export const extendSessionTime = (sessionId, minutes) => async (dispatch, getState) => {
+    return createAuthenticatedCallWithToken(
+        dispatch,
+        getState,
+        EXTEND_SESSION_TIME,
+        () => api.post(`/sessions/${sessionId}/extend`, { minutes }),
+        SESSION_ERROR
+    );
 };
 
 // Update time remaining
-export const updateTimeRemaining = (sessionId) => async (dispatch, getState) => {
-    try {
-        const token = getState().auth.token;
-        const config = {
-            headers: {
-                'Authorization': `Bearer ${token}`
-            }
-        };
-
-        const res = await axios.get(`/api/sessions/${sessionId}/time`, config);
-        dispatch({
-            type: UPDATE_TIME_REMAINING,
-            payload: res.data
-        });
-    } catch (err) {
-        dispatch({
-            type: SESSION_ERROR,
-            payload: err.response?.data?.message || 'Error updating time'
-        });
-    }
+export const updateTimeRemaining = (seconds) => (dispatch) => {
+    dispatch({
+        type: UPDATE_TIME_REMAINING,
+        payload: seconds
+    });
 };
 
 // Set current session

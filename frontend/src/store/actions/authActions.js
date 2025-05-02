@@ -1,4 +1,4 @@
-import axios from 'axios';
+import api, { createAuthenticatedCall, createAuthenticatedCallWithToken } from '../../utils/api';
 import {
     REGISTER_SUCCESS,
     REGISTER_FAIL,
@@ -12,61 +12,36 @@ import {
 
 // Load User
 export const loadUser = () => async (dispatch, getState) => {
-    try {
-        const token = getState().auth.token;
-        if (!token) return;
+    const token = getState().auth.token;
+    if (!token) return;
 
-        const config = {
-            headers: {
-                'Authorization': `Bearer ${token}`
-            }
-        };
-
-        const res = await axios.get('/api/auth/profile', config);
-        dispatch({
-            type: USER_LOADED,
-            payload: res.data
-        });
-    } catch (err) {
-        dispatch({
-            type: AUTH_ERROR,
-            payload: err.response?.data?.message || 'Error loading user'
-        });
-    }
+    return createAuthenticatedCallWithToken(
+        dispatch,
+        getState,
+        USER_LOADED,
+        () => api.get('/auth/profile'),
+        AUTH_ERROR
+    );
 };
 
 // Register User
 export const register = (userData) => async (dispatch) => {
-    try {
-        const res = await axios.post('/api/auth/register', userData);
-        dispatch({
-            type: REGISTER_SUCCESS,
-            payload: res.data
-        });
-        dispatch(loadUser());
-    } catch (err) {
-        dispatch({
-            type: REGISTER_FAIL,
-            payload: err.response?.data?.message || 'Registration failed'
-        });
-    }
+    return createAuthenticatedCall(
+        dispatch,
+        REGISTER_SUCCESS,
+        () => api.post('/auth/register', userData),
+        REGISTER_FAIL
+    ).then(() => dispatch(loadUser()));
 };
 
 // Login User
 export const login = (userData) => async (dispatch) => {
-    try {
-        const res = await axios.post('/api/auth/login', userData);
-        dispatch({
-            type: LOGIN_SUCCESS,
-            payload: res.data
-        });
-        dispatch(loadUser());
-    } catch (err) {
-        dispatch({
-            type: LOGIN_FAIL,
-            payload: err.response?.data?.message || 'Login failed'
-        });
-    }
+    return createAuthenticatedCall(
+        dispatch,
+        LOGIN_SUCCESS,
+        () => api.post('/auth/login', userData),
+        LOGIN_FAIL
+    ).then(() => dispatch(loadUser()));
 };
 
 // Logout User
@@ -76,45 +51,24 @@ export const logout = () => (dispatch) => {
 
 // Update Profile
 export const updateProfile = (profileData) => async (dispatch, getState) => {
-    try {
-        const token = getState().auth.token;
-        const config = {
-            headers: {
-                'Authorization': `Bearer ${token}`
-            }
-        };
-
-        const res = await axios.put('/api/auth/profile', profileData, config);
-        dispatch({
-            type: USER_LOADED,
-            payload: res.data
-        });
-    } catch (err) {
-        dispatch({
-            type: AUTH_ERROR,
-            payload: err.response?.data?.message || 'Error updating profile'
-        });
-    }
+    return createAuthenticatedCallWithToken(
+        dispatch,
+        getState,
+        USER_LOADED,
+        () => api.put('/auth/profile', profileData),
+        AUTH_ERROR
+    );
 };
 
 // Change Password
 export const changePassword = (passwordData) => async (dispatch, getState) => {
-    try {
-        const token = getState().auth.token;
-        const config = {
-            headers: {
-                'Authorization': `Bearer ${token}`
-            }
-        };
-
-        await axios.put('/api/auth/password', passwordData, config);
-        dispatch(loadUser());
-    } catch (err) {
-        dispatch({
-            type: AUTH_ERROR,
-            payload: err.response?.data?.message || 'Error changing password'
-        });
-    }
+    return createAuthenticatedCallWithToken(
+        dispatch,
+        getState,
+        USER_LOADED,
+        () => api.put('/auth/password', passwordData),
+        AUTH_ERROR
+    ).then(() => dispatch(loadUser()));
 };
 
 // Clear Errors

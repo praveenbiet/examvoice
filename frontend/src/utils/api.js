@@ -109,4 +109,30 @@ export const formatExamResults = (results) => {
     };
 };
 
+// Create authenticated API call wrapper
+export const createAuthenticatedCall = async (dispatch, action, apiCall, errorType) => {
+    try {
+        const res = await apiCall();
+        dispatch({
+            type: action,
+            payload: res.data
+        });
+        return res.data;
+    } catch (err) {
+        const error = handleApiError(err);
+        dispatch({
+            type: errorType,
+            payload: error.message
+        });
+        throw error;
+    }
+};
+
+// Create authenticated API call with token
+export const createAuthenticatedCallWithToken = async (dispatch, getState, action, apiCall, errorType) => {
+    const token = getState().auth.token;
+    setAuthToken(token);
+    return createAuthenticatedCall(dispatch, action, apiCall, errorType);
+};
+
 export default api; 
