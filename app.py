@@ -32,6 +32,7 @@ class ExamResult(db.Model):
     candidate_answer = db.Column(db.String(1000), nullable=False)
     similarity_score = db.Column(db.Float, nullable=False)
     audio_path = db.Column(db.String(500), nullable=True)
+    feedback_audio_path = db.Column(db.String(500), nullable=True)
     timestamp = db.Column(db.DateTime, default=datetime.utcnow)
 
 @app.route('/')
@@ -82,26 +83,26 @@ def process_answer():
             question.correct_answer
         )
         
+        # Generate feedback audio
+        feedback_text = f"Your answer was {similarity_score*100:.2f}% similar to the correct answer."
+        feedback_audio_path = text_to_speech.synthesize(feedback_text)
+        
         # Save result
         result = ExamResult(
             candidate_id=session['candidate_id'],
             question_id=question_id,
             candidate_answer=candidate_answer,
             similarity_score=similarity_score,
-            audio_path=audio_path
+            audio_path=audio_path,
+            feedback_audio_path=feedback_audio_path
         )
         db.session.add(result)
         db.session.commit()
         
-        # Generate feedback
-        feedback = text_to_speech.synthesize(
-            f"Your answer was {similarity_score*100:.2f}% similar to the correct answer."
-        )
-        
         return jsonify({
             'status': 'success',
             'similarity_score': similarity_score,
-            'feedback': feedback,
+            'feedback_audio_path': feedback_audio_path,
             'transcribed_text': candidate_answer
         })
     except Exception as e:
@@ -110,14 +111,21 @@ def process_answer():
 @app.route('/get_audio/<int:result_id>', methods=['GET'])
 def get_audio(result_id):
     result = ExamResult.query.get_or_404(result_id)
-    if not result.audio_path or not os.path.exists(result.audio_path):
+    audio_type = request.args.get('type', 'answer')  # 'answer' or 'feedback'
+    
+    if audio_type == 'answer':
+        audio_path = result.audio_path
+    else:
+        audio_path = result.feedback_audio_path
+    
+    if not audio_path or not os.path.exists(audio_path):
         return jsonify({'error': 'Audio file not found'}), 404
     
     return send_file(
-        result.audio_path,
+        audio_path,
         mimetype='audio/wav',
         as_attachment=True,
-        download_name=f'answer_{result_id}.wav'
+        download_name=f'{audio_type}_{result_id}.wav'
     )
 
 if __name__ == '__main__':
