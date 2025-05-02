@@ -10,6 +10,108 @@ import os
 from datetime import datetime
 import torchaudio
 from speechbrain.pretrained import SpeakerRecognition
+from flask_sqlalchemy import SQLAlchemy
+
+db = SQLAlchemy()
+
+class User(db.Model):
+    __tablename__ = 'users'
+    
+    id = db.Column(db.Integer, primary_key=True)
+    username = db.Column(db.String(80), unique=True, nullable=False)
+    email = db.Column(db.String(120), unique=True, nullable=False)
+    password_hash = db.Column(db.String(128), nullable=False)
+    role = db.Column(db.String(20), nullable=False)  # 'admin', 'examiner', 'candidate'
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    last_login = db.Column(db.DateTime)
+    is_active = db.Column(db.Boolean, default=True)
+    
+    # Relationships
+    exams_created = db.relationship('Exam', backref='creator', lazy=True)
+    exam_sessions = db.relationship('ExamSession', backref='candidate', lazy=True)
+    
+    def __repr__(self):
+        return f'<User {self.username}>'
+
+class Exam(db.Model):
+    __tablename__ = 'exams'
+    
+    id = db.Column(db.Integer, primary_key=True)
+    title = db.Column(db.String(200), nullable=False)
+    description = db.Column(db.Text)
+    creator_id = db.Column(db.Integer, db.ForeignKey('users.id'), nullable=False)
+    duration_minutes = db.Column(db.Integer, nullable=False)
+    passing_score = db.Column(db.Float, nullable=False)
+    is_active = db.Column(db.Boolean, default=True)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    
+    # Relationships
+    questions = db.relationship('Question', backref='exam', lazy=True)
+    sessions = db.relationship('ExamSession', backref='exam', lazy=True)
+    
+    def __repr__(self):
+        return f'<Exam {self.title}>'
+
+class Question(db.Model):
+    __tablename__ = 'questions'
+    
+    id = db.Column(db.Integer, primary_key=True)
+    exam_id = db.Column(db.Integer, db.ForeignKey('exams.id'), nullable=False)
+    question_text = db.Column(db.Text, nullable=False)
+    correct_answer = db.Column(db.Text, nullable=False)
+    max_score = db.Column(db.Float, nullable=False)
+    order = db.Column(db.Integer, nullable=False)
+    
+    # Relationships
+    responses = db.relationship('ExamResponse', backref='question', lazy=True)
+    
+    def __repr__(self):
+        return f'<Question {self.id}>'
+
+class ExamSession(db.Model):
+    __tablename__ = 'exam_sessions'
+    
+    id = db.Column(db.Integer, primary_key=True)
+    exam_id = db.Column(db.Integer, db.ForeignKey('exams.id'), nullable=False)
+    candidate_id = db.Column(db.Integer, db.ForeignKey('users.id'), nullable=False)
+    start_time = db.Column(db.DateTime, default=datetime.utcnow)
+    end_time = db.Column(db.DateTime)
+    status = db.Column(db.String(20), default='in_progress')  # 'in_progress', 'completed', 'abandoned'
+    total_score = db.Column(db.Float, default=0.0)
+    
+    # Relationships
+    responses = db.relationship('ExamResponse', backref='session', lazy=True)
+    
+    def __repr__(self):
+        return f'<ExamSession {self.id}>'
+
+class ExamResponse(db.Model):
+    __tablename__ = 'exam_responses'
+    
+    id = db.Column(db.Integer, primary_key=True)
+    session_id = db.Column(db.Integer, db.ForeignKey('exam_sessions.id'), nullable=False)
+    question_id = db.Column(db.Integer, db.ForeignKey('questions.id'), nullable=False)
+    audio_path = db.Column(db.String(500), nullable=False)
+    transcribed_text = db.Column(db.Text)
+    score = db.Column(db.Float)
+    feedback = db.Column(db.Text)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    
+    def __repr__(self):
+        return f'<ExamResponse {self.id}>'
+
+class VoiceProfile(db.Model):
+    __tablename__ = 'voice_profiles'
+    
+    id = db.Column(db.Integer, primary_key=True)
+    user_id = db.Column(db.Integer, db.ForeignKey('users.id'), nullable=False)
+    voice_sample_path = db.Column(db.String(500), nullable=False)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    is_active = db.Column(db.Boolean, default=True)
+    
+    def __repr__(self):
+        return f'<VoiceProfile {self.id}>'
 
 class VoiceRecognition:
     def __init__(self):
